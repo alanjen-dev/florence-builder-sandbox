@@ -16,7 +16,3 @@ Not allowed:
 - Runtime, daemon, service, or LaunchAgent changes.
 - Vault, Personal Zone, Mac mini, DGX, or OpenClaw changes.
 - Broad refactors or multi-area edits.
-
-Merge rule:
-
-- Auto-merge may be used only when the protected GPT schema review check returns APPROVE.
