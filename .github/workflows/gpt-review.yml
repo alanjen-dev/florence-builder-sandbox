@@ -29,9 +29,22 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
           git diff --find-renames --find-copies "$BASE_SHA" "$HEAD_SHA" > pr.diff
+          python3 <<'PY' > pr-context.json
+          import json
+          import os
+
+          print(json.dumps({
+              "number": os.environ.get("PR_NUMBER", ""),
+              "title": os.environ.get("PR_TITLE", ""),
+              "body": os.environ.get("PR_BODY", ""),
+          }, indent=2))
+          PY
           if [ -f REPORT.md ]; then
             cp REPORT.md report-under-review.md
           else
@@ -43,6 +56,7 @@ jobs:
         run: |
           printf "workflow_dispatch run: no pull request diff available.\n" > changed-files.txt
           printf "workflow_dispatch run: no pull request diff available.\n" > pr.diff
+          printf '{"number":"","title":"workflow_dispatch","body":"Manual workflow_dispatch run."}\n' > pr-context.json
           if [ -f REPORT.md ]; then
             cp REPORT.md report-under-review.md
           else
@@ -109,12 +123,15 @@ jobs:
           - APPROVE only when the diff is exactly within the requested scope, low risk, and no protected boundary is touched.
           - MODIFY when the PR is basically safe but needs small, specific changes before merge.
           - REJECT when the PR is unnecessary, overbroad, unsafe, or does not satisfy the request.
-          - BLOCKED when the repo, diff, report, permissions, secrets, or protected-boundary status cannot be verified.
+          - BLOCKED when the repo, diff, PR title/body, report, permissions, secrets, or protected-boundary status cannot be verified.
 
           Protected boundaries include production repos, secrets, credentials, workflows unrelated to this task, repo settings, branch protection, auto-merge, vaults, Personal Zone, runtime/daemon/service/LaunchAgent changes, Mac mini, DGX, and OpenClaw.
+
+          Treat PR title/body as valid review context when REPORT.md is absent. Do not block only because REPORT.md is absent if the PR title/body clearly states the requested task and expected fixture verdict.
           """
 
           user_prompt = {
+              "pr_context": json.loads(read_text("pr-context.json")),
               "changed_files": read_text("changed-files.txt"),
               "diff": read_text("pr.diff"),
               "report_md": read_text("report-under-review.md"),
