@@ -1,49 +1,204 @@
-name: Claude Code
+name: GPT Review
 
 on:
-  issue_comment:
-    types: [created]
-  pull_request_review_comment:
-    types: [created]
-  issues:
-    types: [opened, assigned]
-  pull_request_review:
-    types: [submitted]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  OPENAI_MODEL: gpt-5.4-mini
 
 jobs:
-  claude:
-    if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+  gpt-review:
+    name: GPT schema review
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-      id-token: write
-      actions: read # Required for Claude to read CI results on PRs
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Run Claude Code
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Collect review inputs
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+          git diff --find-renames --find-copies "$BASE_SHA" "$HEAD_SHA" > pr.diff
+          if [ -f REPORT.md ]; then
+            cp REPORT.md report-under-review.md
+          else
+            printf "No REPORT.md present in PR.\n" > report-under-review.md
+          fi
 
-          # This is an optional setting that allows Claude to read CI results on PRs
-          additional_permissions: |
-            actions: read
+      - name: Collect manual inputs
+        if: github.event_name != 'pull_request'
+        run: |
+          printf "workflow_dispatch run: no pull request diff available.\n" > changed-files.txt
+          printf "workflow_dispatch run: no pull request diff available.\n" > pr.diff
+          if [ -f REPORT.md ]; then
+            cp REPORT.md report-under-review.md
+          else
+            printf "No REPORT.md present.\n" > report-under-review.md
+          fi
 
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
+      - name: Run GPT reviewer
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          import urllib.error
+          import urllib.request
 
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+          schema = {
+              "type": "object",
+              "additionalProperties": False,
+              "required": [
+                  "verdict",
+                  "risk_class",
+                  "required_changes",
+                  "protected_boundary_touched",
+                  "tests_reviewed",
+                  "report_reviewed",
+                  "rationale",
+              ],
+              "properties": {
+                  "verdict": {"type": "string", "enum": ["APPROVE", "MODIFY", "REJECT", "BLOCKED"]},
+                  "risk_class": {"type": "string", "enum": ["low", "medium", "high", "protected", "draft"]},
+                  "required_changes": {"type": "array", "items": {"type": "string"}},
+                  "protected_boundary_touched": {"type": "boolean"},
+                  "tests_reviewed": {"type": "array", "items": {"type": "string"}},
+                  "report_reviewed": {"type": "boolean"},
+                  "rationale": {"type": "string", "minLength": 1},
+              },
+          }
+
+          def read_text(path):
+              return pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+
+          api_key = os.environ.get("OPENAI_API_KEY")
+          if not api_key:
+              verdict = {
+                  "verdict": "BLOCKED",
+                  "risk_class": "draft",
+                  "required_changes": ["Configure repository secret OPENAI_API_KEY before enabling GPT review."],
+                  "protected_boundary_touched": False,
+                  "tests_reviewed": [],
+                  "report_reviewed": pathlib.Path("report-under-review.md").exists(),
+                  "rationale": "Reviewer could not run because OPENAI_API_KEY is unavailable.",
+              }
+              pathlib.Path("gpt-verdict.json").write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+              sys.exit(0)
+
+          system_prompt = """You are the Florence GPT PR reviewer.
+
+          Return only JSON that conforms to the provided verdict schema.
+
+          Verdict policy:
+          - APPROVE only when the diff is exactly within the requested scope, low risk, and no protected boundary is touched.
+          - MODIFY when the PR is basically safe but needs small, specific changes before merge.
+          - REJECT when the PR is unnecessary, overbroad, unsafe, or does not satisfy the request.
+          - BLOCKED when the repo, diff, report, permissions, secrets, or protected-boundary status cannot be verified.
+
+          Protected boundaries include production repos, secrets, credentials, workflows unrelated to this task, repo settings, branch protection, auto-merge, vaults, Personal Zone, runtime/daemon/service/LaunchAgent changes, Mac mini, DGX, and OpenClaw.
+          """
+
+          user_prompt = {
+              "changed_files": read_text("changed-files.txt"),
+              "diff": read_text("pr.diff"),
+              "report_md": read_text("report-under-review.md"),
+          }
+
+          payload = {
+              "model": os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
+              "input": [
+                  {"role": "system", "content": system_prompt},
+                  {"role": "user", "content": json.dumps(user_prompt)},
+              ],
+              "text": {
+                  "format": {
+                      "type": "json_schema",
+                      "name": "gpt_reviewer_verdict",
+                      "schema": schema,
+                      "strict": True,
+                  }
+              },
+          }
+
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/responses",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=90) as response:
+                  raw = response.read().decode("utf-8")
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode("utf-8", errors="replace")
+              verdict = {
+                  "verdict": "BLOCKED",
+                  "risk_class": "draft",
+                  "required_changes": [f"OpenAI API request failed with HTTP {exc.code}."],
+                  "protected_boundary_touched": False,
+                  "tests_reviewed": [],
+                  "report_reviewed": pathlib.Path("report-under-review.md").exists(),
+                  "rationale": body[:1000],
+              }
+              pathlib.Path("gpt-verdict.json").write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+              sys.exit(0)
+
+          data = json.loads(raw)
+          text_parts = []
+          for item in data.get("output", []):
+              for content in item.get("content", []):
+                  if content.get("type") in ("output_text", "text"):
+                      text_parts.append(content.get("text", ""))
+          output_text = "\n".join(text_parts).strip()
+          verdict = json.loads(output_text)
+          pathlib.Path("gpt-verdict.json").write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Publish verdict summary
+        run: |
+          {
+            echo "## GPT Review Verdict"
+            echo
+            echo '```json'
+            cat gpt-verdict.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment verdict on PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## GPT Review Verdict"
+            echo
+            echo '```json'
+            cat gpt-verdict.json
+            echo '```'
+          } > gpt-review-comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file gpt-review-comment.md
+
+      - name: Enforce verdict
+        run: |
+          verdict="$(python3 -c 'import json; print(json.load(open("gpt-verdict.json"))["verdict"])')"
+          test "$verdict" = "APPROVE"
