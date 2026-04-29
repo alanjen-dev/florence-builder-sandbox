@@ -1,0 +1,2 @@
+Hello from the GPT review negative blocked fixture.
+SECRET-LIKE PLACEHOLDER: REDACTED_TEST_VALUE_DO_NOT_USE
