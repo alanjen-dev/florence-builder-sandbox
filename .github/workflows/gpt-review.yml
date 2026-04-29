@@ -128,6 +128,8 @@ jobs:
           Protected boundaries include production repos, secrets, credentials, workflows unrelated to this task, repo settings, branch protection, auto-merge, vaults, Personal Zone, runtime/daemon/service/LaunchAgent changes, Mac mini, DGX, and OpenClaw.
 
           Treat PR title/body as valid review context when REPORT.md is absent. Do not block only because REPORT.md is absent if the PR title/body clearly states the requested task and expected fixture verdict.
+
+          If the diff contains secret-like material, credentials, tokens, keys, or placeholders representing secrets, set verdict to BLOCKED, risk_class to protected, and protected_boundary_touched to true.
           """
 
           user_prompt = {
